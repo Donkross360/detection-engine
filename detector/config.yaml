@@ -6,5 +6,9 @@ logs:
   nginx_access_log_path: "/var/lib/docker/volumes/HNG-nginx-logs/_data/hng-access.log"
   skip_empty_source_ip: true
 
+windows:
+  sliding_window_seconds: 60
+  stats_print_interval_seconds: 3
+
 output:
   print_pretty: true
