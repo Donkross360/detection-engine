@@ -1,0 +1,10 @@
+app:
+  environment: "dev"
+  poll_interval_seconds: 0.2
+
+logs:
+  nginx_access_log_path: "/var/lib/docker/volumes/HNG-nginx-logs/_data/hng-access.log"
+  skip_empty_source_ip: true
+
+output:
+  print_pretty: true
