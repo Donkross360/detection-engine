@@ -11,6 +11,14 @@ windows:
   stats_print_interval_seconds: 3
   stats_thread_enabled: true
 
+baseline:
+  window_seconds: 1800
+  recalc_interval_seconds: 60
+  min_current_hour_samples: 300
+  mean_floor: 0.1
+  stddev_floor: 0.1
+  error_floor: 0.01
+
 output:
   print_pretty: true
   print_events: true
