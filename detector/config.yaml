@@ -9,6 +9,8 @@ logs:
 windows:
   sliding_window_seconds: 60
   stats_print_interval_seconds: 3
+  stats_thread_enabled: true
 
 output:
   print_pretty: true
+  print_events: true

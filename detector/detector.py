@@ -1,6 +1,7 @@
 from collections import defaultdict, deque
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
+import threading
 from typing import Deque, Dict, List, Tuple
 
 from monitor import LogEvent
@@ -18,6 +19,7 @@ class SlidingWindowSnapshot:
 class SlidingWindowEngine:
     def __init__(self, window_seconds: int = 60) -> None:
         self.window_seconds = window_seconds
+        self._lock = threading.Lock()
         self.global_window: Deque[datetime] = deque()
         self.ip_windows: Dict[str, Deque[datetime]] = defaultdict(deque)
 
@@ -49,28 +51,30 @@ class SlidingWindowEngine:
 
     def add_event(self, event: LogEvent) -> None:
         event_time = self._parse_event_time(event)
-        self.global_window.append(event_time)
-        self.ip_windows[event.source_ip].append(event_time)
-        self._evict_old(event_time)
+        with self._lock:
+            self.global_window.append(event_time)
+            self.ip_windows[event.source_ip].append(event_time)
+            self._evict_old(event_time)
 
     def snapshot(self) -> SlidingWindowSnapshot:
-        now_utc = datetime.now(timezone.utc)
-        self._evict_old(now_utc)
+        with self._lock:
+            now_utc = datetime.now(timezone.utc)
+            self._evict_old(now_utc)
 
-        total = len(self.global_window)
-        global_rps = total / float(self.window_seconds)
+            total = len(self.global_window)
+            global_rps = total / float(self.window_seconds)
 
-        ip_stats: List[Tuple[str, float, int]] = []
-        for ip, window in self.ip_windows.items():
-            count = len(window)
-            ip_stats.append((ip, count / float(self.window_seconds), count))
+            ip_stats: List[Tuple[str, float, int]] = []
+            for ip, window in self.ip_windows.items():
+                count = len(window)
+                ip_stats.append((ip, count / float(self.window_seconds), count))
 
-        ip_stats.sort(key=lambda item: item[2], reverse=True)
+            ip_stats.sort(key=lambda item: item[2], reverse=True)
 
-        return SlidingWindowSnapshot(
-            window_seconds=self.window_seconds,
-            total_requests_last_window=total,
-            global_rps=global_rps,
-            unique_ips=len(self.ip_windows),
-            top_ips=ip_stats[:10],
-        )
+            return SlidingWindowSnapshot(
+                window_seconds=self.window_seconds,
+                total_requests_last_window=total,
+                global_rps=global_rps,
+                unique_ips=len(self.ip_windows),
+                top_ips=ip_stats[:10],
+            )
