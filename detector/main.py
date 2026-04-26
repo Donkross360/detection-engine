@@ -1,13 +1,18 @@
 import json
 import threading
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, Optional
 
 import yaml
 
+from audit import AuditLogger
 from baseline import BaselineSnapshot, RollingBaselineEngine
+from blocker import IptablesBlocker
 from detector import AnomalyEvaluator, AnomalySignal, SlidingWindowEngine, SlidingWindowSnapshot
 from monitor import NginxLogMonitor
+from notifier import SlackNotifier
+from unbanner import BanRecord, UnbanScheduler
 
 
 def load_config(config_path: Path) -> Dict[str, Any]:
@@ -71,6 +76,12 @@ def print_anomaly(signal: AnomalySignal) -> None:
     )
 
 
+def ban_duration_to_text(record: BanRecord) -> str:
+    if record.duration_seconds is None:
+        return "permanent"
+    return f"{record.duration_seconds}s"
+
+
 def run() -> None:
     config = load_config(Path(__file__).with_name("config.yaml"))
     logs_config = config.get("logs", {})
@@ -78,6 +89,9 @@ def run() -> None:
     windows_config = config.get("windows", {})
     baseline_config = config.get("baseline", {})
     detection_config = config.get("detection", {})
+    blocking_config = config.get("blocking", {})
+    alerts_config = config.get("alerts", {})
+    audit_config = config.get("audit", {})
     output_config = config.get("output", {})
 
     monitor = NginxLogMonitor(
@@ -113,6 +127,25 @@ def run() -> None:
             detection_config.get("alert_cooldown_seconds", 10)
         ),
     )
+    blocker = IptablesBlocker(
+        protected_cidrs=blocking_config.get("protected_cidrs", [])
+    )
+    unban_scheduler = UnbanScheduler(
+        backoff_seconds=blocking_config.get(
+            "ban_durations_seconds", [600, 1800, 7200, None]
+        )
+    )
+    notifier = SlackNotifier(
+        webhook_url=str(alerts_config.get("slack_webhook_url", "")),
+        enabled=bool(alerts_config.get("enabled", False)),
+    )
+    audit_logger = AuditLogger(
+        audit_log_path=str(
+            audit_config.get(
+                "log_path", "/home/ubuntu/detection-engine/detector/audit.log"
+            )
+        )
+    )
 
     pretty = bool(output_config.get("print_pretty", True))
     print_events = bool(output_config.get("print_events", True))
@@ -123,6 +156,7 @@ def run() -> None:
     baseline_recalc_interval_seconds = float(
         baseline_config.get("recalc_interval_seconds", 60)
     )
+    unban_check_interval_seconds = float(blocking_config.get("unban_check_interval", 2))
 
     stats_stop = threading.Event()
 
@@ -147,11 +181,31 @@ def run() -> None:
             return
 
         # Run one recalculation immediately at startup for visibility.
-        print_baseline_stats(baseline_engine.recalculate())
+        baseline_snapshot = baseline_engine.recalculate()
+        print_baseline_stats(baseline_snapshot)
+        audit_logger.write(
+            timestamp=baseline_snapshot.recalculated_at,
+            action="BASELINE_RECALC",
+            ip="-",
+            condition="scheduled",
+            rate=baseline_snapshot.effective_mean,
+            baseline=baseline_snapshot.effective_stddev,
+            duration="-",
+        )
         while not stats_stop.is_set():
             if stats_stop.wait(timeout=baseline_recalc_interval_seconds):
                 return
-            print_baseline_stats(baseline_engine.recalculate())
+            baseline_snapshot = baseline_engine.recalculate()
+            print_baseline_stats(baseline_snapshot)
+            audit_logger.write(
+                timestamp=baseline_snapshot.recalculated_at,
+                action="BASELINE_RECALC",
+                ip="-",
+                condition="scheduled",
+                rate=baseline_snapshot.effective_mean,
+                baseline=baseline_snapshot.effective_stddev,
+                duration="-",
+            )
 
     baseline_thread = threading.Thread(
         target=baseline_loop,
@@ -159,6 +213,37 @@ def run() -> None:
         daemon=True,
     )
     baseline_thread.start()
+
+    def unban_loop() -> None:
+        if unban_check_interval_seconds <= 0:
+            return
+        while not stats_stop.is_set():
+            if stats_stop.wait(timeout=unban_check_interval_seconds):
+                return
+            for record in unban_scheduler.due_unbans():
+                ok, reason = blocker.unblock_ip(record.ip)
+                if ok or reason == "not-blocked":
+                    unban_scheduler.clear_ban(record.ip)
+                    notifier.send_unban_alert(record.ip)
+                    now_iso = datetime.now(timezone.utc).isoformat()
+                    audit_logger.write(
+                        timestamp=now_iso,
+                        action="UNBAN",
+                        ip=record.ip,
+                        condition="backoff-expired",
+                        rate=0.0,
+                        baseline=0.0,
+                        duration="released",
+                    )
+                else:
+                    print(f"[unban] ip={record.ip} reason={reason}")
+
+    unban_thread = threading.Thread(
+        target=unban_loop,
+        name="unban-scheduler",
+        daemon=True,
+    )
+    unban_thread.start()
 
     print("Starting detector monitor...")
     print(f"Reading log file: {monitor.log_path}")
@@ -184,11 +269,57 @@ def run() -> None:
                 )
                 for finding in findings:
                     print_anomaly(finding)
+                    now_iso = datetime.now(timezone.utc).isoformat()
+                    if finding.scope == "global":
+                        notifier.send_global_alert(
+                            condition=finding.condition,
+                            current_rate=finding.current_rate,
+                            baseline=finding.baseline_mean,
+                        )
+                        audit_logger.write(
+                            timestamp=now_iso,
+                            action="GLOBAL_ALERT",
+                            ip="-",
+                            condition=finding.condition,
+                            rate=finding.current_rate,
+                            baseline=finding.baseline_mean,
+                            duration="-",
+                        )
+                        continue
+
+                    if finding.ip is None:
+                        continue
+                    if unban_scheduler.is_currently_banned(finding.ip):
+                        continue
+
+                    blocked, reason = blocker.block_ip(finding.ip)
+                    if not blocked:
+                        print(f"[block] ip={finding.ip} skipped reason={reason}")
+                        continue
+
+                    record = unban_scheduler.register_ban(finding.ip)
+                    notifier.send_ban_alert(
+                        ip=finding.ip,
+                        condition=finding.condition,
+                        current_rate=finding.current_rate,
+                        baseline=finding.baseline_mean,
+                        duration_seconds=record.duration_seconds,
+                    )
+                    audit_logger.write(
+                        timestamp=now_iso,
+                        action="BAN",
+                        ip=finding.ip,
+                        condition=finding.condition,
+                        rate=finding.current_rate,
+                        baseline=finding.baseline_mean,
+                        duration=ban_duration_to_text(record),
+                    )
     finally:
         stats_stop.set()
         if stats_thread is not None:
             stats_thread.join(timeout=2.0)
         baseline_thread.join(timeout=2.0)
+        unban_thread.join(timeout=2.0)
 
 
 if __name__ == "__main__":
