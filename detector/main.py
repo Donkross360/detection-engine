@@ -1,5 +1,6 @@
 import json
 import threading
+import time
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, Optional
@@ -9,6 +10,7 @@ import yaml
 from audit import AuditLogger
 from baseline import BaselineSnapshot, RollingBaselineEngine
 from blocker import IptablesBlocker
+from dashboard import DashboardServer, build_metrics
 from detector import AnomalyEvaluator, AnomalySignal, SlidingWindowEngine, SlidingWindowSnapshot
 from monitor import NginxLogMonitor
 from notifier import SlackNotifier
@@ -92,6 +94,7 @@ def run() -> None:
     blocking_config = config.get("blocking", {})
     alerts_config = config.get("alerts", {})
     audit_config = config.get("audit", {})
+    dashboard_config = config.get("dashboard", {})
     output_config = config.get("output", {})
 
     monitor = NginxLogMonitor(
@@ -157,8 +160,52 @@ def run() -> None:
         baseline_config.get("recalc_interval_seconds", 60)
     )
     unban_check_interval_seconds = float(blocking_config.get("unban_check_interval", 2))
+    dashboard_enabled = bool(dashboard_config.get("enabled", True))
+    started_at_monotonic = time.monotonic()
 
     stats_stop = threading.Event()
+
+    dashboard_state_lock = threading.Lock()
+    dashboard_window_state: Dict[str, Any] = {"global_rps": 0.0, "top_ips": []}
+    dashboard_baseline_state: Dict[str, Any] = {
+        "effective_mean": 0.0,
+        "effective_stddev": 0.0,
+    }
+
+    def get_dashboard_metrics() -> Dict[str, Any]:
+        with dashboard_state_lock:
+            window_state = dict(dashboard_window_state)
+            baseline_state = dict(dashboard_baseline_state)
+            bans = [
+                {
+                    "ip": b.ip,
+                    "offense_count": b.offense_count,
+                    "duration": "permanent"
+                    if b.duration_seconds is None
+                    else f"{b.duration_seconds}s",
+                }
+                for b in unban_scheduler.active_bans()
+            ]
+        return build_metrics(
+            window_snapshot=window_state,
+            baseline_snapshot=baseline_state,
+            banned_ips=bans,
+            started_at_monotonic=started_at_monotonic,
+        )
+
+    dashboard_server: Optional[DashboardServer] = None
+    if dashboard_enabled:
+        dashboard_server = DashboardServer(
+            host=str(dashboard_config.get("host", "0.0.0.0")),
+            port=int(dashboard_config.get("port", 8088)),
+            refresh_seconds=int(dashboard_config.get("refresh_seconds", 3)),
+            get_metrics=get_dashboard_metrics,
+        )
+        dashboard_server.start()
+        print(
+            "Dashboard started at "
+            f"http://{dashboard_config.get('host', '0.0.0.0')}:{dashboard_config.get('port', 8088)}"
+        )
 
     def stats_loop() -> None:
         if stats_print_interval_seconds <= 0:
@@ -167,6 +214,12 @@ def run() -> None:
         while not stats_stop.is_set():
             snapshot = engine.snapshot()
             print_window_stats(snapshot)
+            with dashboard_state_lock:
+                dashboard_window_state["global_rps"] = snapshot.global_rps
+                dashboard_window_state["top_ips"] = [
+                    {"ip": ip, "rps": ip_rps, "count": count}
+                    for ip, ip_rps, count in snapshot.top_ips[:10]
+                ]
 
             if stats_stop.wait(timeout=stats_print_interval_seconds):
                 return
@@ -183,6 +236,11 @@ def run() -> None:
         # Run one recalculation immediately at startup for visibility.
         baseline_snapshot = baseline_engine.recalculate()
         print_baseline_stats(baseline_snapshot)
+        with dashboard_state_lock:
+            dashboard_baseline_state["effective_mean"] = baseline_snapshot.effective_mean
+            dashboard_baseline_state["effective_stddev"] = (
+                baseline_snapshot.effective_stddev
+            )
         audit_logger.write(
             timestamp=baseline_snapshot.recalculated_at,
             action="BASELINE_RECALC",
@@ -197,6 +255,13 @@ def run() -> None:
                 return
             baseline_snapshot = baseline_engine.recalculate()
             print_baseline_stats(baseline_snapshot)
+            with dashboard_state_lock:
+                dashboard_baseline_state["effective_mean"] = (
+                    baseline_snapshot.effective_mean
+                )
+                dashboard_baseline_state["effective_stddev"] = (
+                    baseline_snapshot.effective_stddev
+                )
             audit_logger.write(
                 timestamp=baseline_snapshot.recalculated_at,
                 action="BASELINE_RECALC",
@@ -320,6 +385,8 @@ def run() -> None:
             stats_thread.join(timeout=2.0)
         baseline_thread.join(timeout=2.0)
         unban_thread.join(timeout=2.0)
+        if dashboard_server is not None:
+            dashboard_server.stop()
 
 
 if __name__ == "__main__":

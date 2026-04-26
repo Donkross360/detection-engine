@@ -58,3 +58,6 @@ class UnbanScheduler:
 
     def is_currently_banned(self, ip: str) -> bool:
         return ip in self._records
+
+    def active_bans(self) -> list[BanRecord]:
+        return list(self._records.values())

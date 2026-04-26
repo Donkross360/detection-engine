@@ -38,10 +38,16 @@ blocking:
 
 alerts:
   slack_webhook_url: ""
-  enabled: false
+  enabled: true
 
 audit:
   log_path: "/home/ubuntu/detection-engine/detector/audit.log"
+
+dashboard:
+  enabled: true
+  host: "0.0.0.0"
+  port: 8088
+  refresh_seconds: 3
 
 output:
   print_pretty: true
