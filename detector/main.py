@@ -1,13 +1,12 @@
 import json
 import threading
-import time
 from pathlib import Path
 from typing import Any, Dict, Optional
 
 import yaml
 
 from baseline import BaselineSnapshot, RollingBaselineEngine
-from detector import SlidingWindowEngine, SlidingWindowSnapshot
+from detector import AnomalyEvaluator, AnomalySignal, SlidingWindowEngine, SlidingWindowSnapshot
 from monitor import NginxLogMonitor
 
 
@@ -46,12 +45,39 @@ def print_baseline_stats(snapshot: BaselineSnapshot) -> None:
     )
 
 
+def print_anomaly(signal: AnomalySignal) -> None:
+    if signal.scope == "global":
+        print(
+            "[anomaly]"
+            " scope=global"
+            f" condition={signal.condition}"
+            f" rate={signal.current_rate:.4f}"
+            f" baseline_mean={signal.baseline_mean:.4f}"
+            f" z={signal.z_score:.4f}"
+            " action=slack_only"
+        )
+        return
+
+    print(
+        "[anomaly]"
+        " scope=ip"
+        f" ip={signal.ip}"
+        f" condition={signal.condition}"
+        f" rate={signal.current_rate:.4f}"
+        f" baseline_mean={signal.baseline_mean:.4f}"
+        f" z={signal.z_score:.4f}"
+        f" tightened={signal.tightened}"
+        " action=ban_candidate"
+    )
+
+
 def run() -> None:
     config = load_config(Path(__file__).with_name("config.yaml"))
     logs_config = config.get("logs", {})
     app_config = config.get("app", {})
     windows_config = config.get("windows", {})
     baseline_config = config.get("baseline", {})
+    detection_config = config.get("detection", {})
     output_config = config.get("output", {})
 
     monitor = NginxLogMonitor(
@@ -70,6 +96,22 @@ def run() -> None:
         mean_floor=float(baseline_config.get("mean_floor", 0.1)),
         stddev_floor=float(baseline_config.get("stddev_floor", 0.1)),
         error_floor=float(baseline_config.get("error_floor", 0.01)),
+    )
+    anomaly_evaluator = AnomalyEvaluator(
+        z_threshold=float(detection_config.get("z_threshold", 3.0)),
+        multiplier_threshold=float(detection_config.get("multiplier_threshold", 5.0)),
+        error_surge_multiplier=float(
+            detection_config.get("error_surge_multiplier", 3.0)
+        ),
+        tightened_z_threshold=float(
+            detection_config.get("tightened_z_threshold", 2.5)
+        ),
+        tightened_multiplier_threshold=float(
+            detection_config.get("tightened_multiplier_threshold", 4.0)
+        ),
+        alert_cooldown_seconds=int(
+            detection_config.get("alert_cooldown_seconds", 10)
+        ),
     )
 
     pretty = bool(output_config.get("print_pretty", True))
@@ -132,6 +174,16 @@ def run() -> None:
                     print(json.dumps(event.to_dict(), indent=2))
                 else:
                     print(json.dumps(event.to_dict()))
+
+            baseline_snapshot = baseline_engine.last_snapshot()
+            if baseline_snapshot is not None:
+                window_snapshot = engine.snapshot()
+                findings = anomaly_evaluator.evaluate(
+                    snapshot=window_snapshot,
+                    baseline=baseline_snapshot,
+                )
+                for finding in findings:
+                    print_anomaly(finding)
     finally:
         stats_stop.set()
         if stats_thread is not None:

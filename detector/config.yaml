@@ -19,6 +19,14 @@ baseline:
   stddev_floor: 0.1
   error_floor: 0.01
 
+detection:
+  z_threshold: 3.0
+  multiplier_threshold: 5.0
+  error_surge_multiplier: 3.0
+  tightened_z_threshold: 2.5
+  tightened_multiplier_threshold: 4.0
+  alert_cooldown_seconds: 10
+
 output:
   print_pretty: true
   print_events: true
