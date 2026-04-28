@@ -5,6 +5,7 @@ from typing import Dict, Optional
 
 @dataclass
 class BanRecord:
+    # `duration_seconds=None` means permanent ban (no scheduled auto-unban).
     ip: str
     offense_count: int
     banned_at_monotonic: float

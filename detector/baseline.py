@@ -10,6 +10,7 @@ from monitor import LogEvent
 
 @dataclass
 class BaselineSnapshot:
+    # `used_current_hour` indicates whether current-hour slot stats were preferred over full 30-min window.
     effective_mean: float
     effective_stddev: float
     error_mean: float
@@ -87,7 +88,7 @@ class RollingBaselineEngine:
         with self._lock:
             total_series, error_series, current_hour_key = self._build_series(now_sec)
 
-        # Group by hour slots and prefer current hour when it has enough samples.
+        # Group per-second counts by hour so baseline can prefer current-hour behavior.
         start_sec = now_sec - self.window_seconds + 1
         totals_by_hour: Dict[str, List[int]] = defaultdict(list)
         errors_by_hour: Dict[str, List[int]] = defaultdict(list)
@@ -103,6 +104,7 @@ class RollingBaselineEngine:
 
         current_hour_totals = totals_by_hour.get(current_hour_key, [])
         current_hour_errors = errors_by_hour.get(current_hour_key, [])
+        # Prefer current-hour behavior once sample confidence is high enough.
         if len(current_hour_totals) >= self.min_current_hour_samples:
             selected_total = current_hour_totals
             selected_error = current_hour_errors
@@ -112,6 +114,7 @@ class RollingBaselineEngine:
         stddev_value = statistics.pstdev(selected_total) if len(selected_total) > 1 else 0.0
         error_mean = statistics.fmean(selected_error) if selected_error else 0.0
 
+        # Floors prevent unstable detection math in low-traffic startup periods.
         snapshot = BaselineSnapshot(
             effective_mean=max(mean_value, self.mean_floor),
             effective_stddev=max(stddev_value, self.stddev_floor),

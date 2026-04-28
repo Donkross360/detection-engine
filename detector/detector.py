@@ -11,6 +11,7 @@ from monitor import LogEvent
 
 @dataclass
 class SlidingWindowSnapshot:
+    # `top_ips` stores tuples as: (ip, requests_per_second, count_in_window).
     window_seconds: int
     total_requests_last_window: int
     global_rps: float
@@ -22,6 +23,7 @@ class SlidingWindowSnapshot:
 
 @dataclass
 class AnomalySignal:
+    # `scope` is either "global" or "ip"; `ban_recommended` is true only for per-IP actions.
     scope: str
     condition: str
     current_rate: float
@@ -51,6 +53,7 @@ class SlidingWindowEngine:
         return parsed.astimezone(timezone.utc)
 
     def _evict_old(self, now_utc: datetime) -> None:
+        # Keep only events inside the active sliding window.
         cutoff = now_utc - timedelta(seconds=self.window_seconds)
 
         while self.global_window and self.global_window[0] < cutoff:
@@ -79,6 +82,7 @@ class SlidingWindowEngine:
         with self._lock:
             self.global_window.append(event_time)
             self.ip_windows[event.source_ip].append(event_time)
+            # Track error traffic separately for adaptive threshold tightening.
             if event.status >= 400:
                 self.ip_error_windows[event.source_ip].append(event_time)
             self._evict_old(event_time)
@@ -157,6 +161,7 @@ class AnomalyEvaluator:
             stddev=baseline.effective_stddev,
         )
         global_condition = ""
+        # Trigger if either statistical outlier or strong multiplier condition is hit.
         if global_z > self.z_threshold:
             global_condition = "z-score"
         elif snapshot.global_rps > self.multiplier_threshold * baseline.effective_mean:
@@ -177,6 +182,7 @@ class AnomalyEvaluator:
 
         for ip, (ip_rps, _count) in snapshot.ip_rates.items():
             error_rps = snapshot.ip_error_rates.get(ip, (0.0, 0))[0]
+            # If an IP's error profile surges, apply tighter per-IP thresholds.
             tightened = error_rps > (self.error_surge_multiplier * baseline.error_mean)
             z_threshold = self.tightened_z_threshold if tightened else self.z_threshold
             mult_threshold = (
@@ -197,6 +203,7 @@ class AnomalyEvaluator:
                 condition = "rate-multiplier"
 
             last_ip_alert_at = self._last_ip_alert_at.get(ip, 0.0)
+            # Apply cooldown to prevent repeated alerts for the same active spike.
             if condition and now - last_ip_alert_at >= self.alert_cooldown_seconds:
                 findings.append(
                     AnomalySignal(
