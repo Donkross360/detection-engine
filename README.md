@@ -1,14 +1,8 @@
-# HNG Stage 3 - Nextcloud Anomaly Detection Engine
+# Anomaly Detection Engine
 
 This project implements a real-time anomaly detection and DDoS response layer for Nextcloud traffic.  
 It tails Nginx JSON access logs, models normal traffic behavior with a rolling baseline, detects anomalies, blocks abusive IPs with iptables, sends Slack alerts, auto-unbans on backoff schedule, and serves a live metrics dashboard.
 
-## Live Endpoints
-
-- **Server IP (Nextcloud by IP):** `http://16.16.153.120`
-- **Metrics Dashboard URL (domain/subdomain):** `http://detector.tutor-ai.im/`
-
-> Replace placeholders before submission. Both endpoints should be live during grading.
 
 ## Links
 
@@ -315,6 +309,11 @@ sudo iptables -L -n | rg DROP
 tail -n 30 /home/ubuntu/detection-engine/detector/audit.log
 ```
 
+### Baseline graph
+
+```bash
+python ~/detection-engine/detector/plot_baseline.py
+```
 ---
 
 
@@ -349,6 +348,6 @@ Cause: manual detector process already running on same port.
 
 ```bash
 sudo systemctl stop detector
-sudo pkill -f "/home/ubuntu/detection-engine/detector/main.py"
+sudo pkill -f "detection-engine/detector/main.py"
 sudo systemctl start detector
 ```
